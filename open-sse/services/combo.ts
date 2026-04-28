@@ -101,6 +101,8 @@ const COMBO_BAD_REQUEST_FALLBACK_PATTERNS = [
   /\bfunction'?s? name (?:can't|can not|is|has) (?:blank|empty|missing)/i,
   /function.*name.*(?:blank|empty|missing)/i,
   /tool_call.*name.*(?:blank|empty|missing)/i,
+  // Anthropic thinking block signature errors — stale/expired signatures cannot be retried (#1696)
+  /invalid.*signature.*thinking/i,
 ];
 
 // Patterns that signal all accounts for a provider are rate-limited / exhausted.
@@ -247,7 +249,14 @@ async function validateResponseQuality(
     return { valid: false, reason: "empty content and no tool_calls in response" };
   }
 
-  return { valid: true };
+  return {
+    valid: true,
+    clonedResponse: new Response(text, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    }),
+  };
 }
 
 // In-memory atomic counter per combo for round-robin distribution
@@ -268,6 +277,13 @@ function normalizeModelEntry(entry) {
 function getTargetProvider(modelStr: string, providerId?: string | null): string {
   const parsed = parseModel(modelStr);
   return providerId || parsed.provider || parsed.providerAlias || "unknown";
+}
+
+function isStreamReadinessTimeoutErrorBody(errorBody: unknown): boolean {
+  if (!errorBody || typeof errorBody !== "object") return false;
+  const error = (errorBody as Record<string, unknown>).error;
+  if (!error || typeof error !== "object") return false;
+  return (error as Record<string, unknown>).code === "STREAM_READINESS_TIMEOUT";
 }
 
 function toRecordedTarget(target: ResolvedComboTarget) {
@@ -1076,6 +1092,7 @@ export async function handleComboChat({
   settings,
   allCombos,
   relayOptions,
+  signal,
 }) {
   const strategy = combo.strategy || "priority";
   const relayConfig =
@@ -1275,6 +1292,7 @@ export async function handleComboChat({
       log,
       settings,
       allCombos,
+      signal,
     });
   }
 
@@ -1510,6 +1528,11 @@ export async function handleComboChat({
 
     // Retry loop for transient errors
     for (let retry = 0; retry <= maxRetries; retry++) {
+      // Fix #1681: Bail out immediately if the client has disconnected
+      if (signal?.aborted) {
+        log.info("COMBO", `Client disconnected — aborting combo loop before model ${modelStr}`);
+        return errorResponse(499, "Client disconnected");
+      }
       globalAttempts++;
       if (globalAttempts > MAX_GLOBAL_ATTEMPTS) {
         log.warn(
@@ -1523,7 +1546,21 @@ export async function handleComboChat({
           "COMBO",
           `Retrying ${modelStr} in ${retryDelayMs}ms (attempt ${retry + 1}/${maxRetries + 1})`
         );
-        await new Promise((r) => setTimeout(r, retryDelayMs));
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, retryDelayMs);
+          signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              resolve(undefined);
+            },
+            { once: true }
+          );
+        });
+        if (signal?.aborted) {
+          log.info("COMBO", `Client disconnected during retry delay — aborting`);
+          return errorResponse(499, "Client disconnected");
+        }
       }
 
       log.info(
@@ -1620,7 +1657,7 @@ export async function handleComboChat({
           }
         }
 
-        return result;
+        return quality.clonedResponse ?? result;
       }
 
       // Extract error info from response
@@ -1663,6 +1700,23 @@ export async function handleComboChat({
       }
 
       const providerBreakerOpen = isProviderBreakerOpenResponse(result, errorBody);
+      const isStreamReadinessTimeout =
+        result.status === 504 && isStreamReadinessTimeoutErrorBody(errorBody);
+
+      // Fix #1681: Status 499 means client disconnected — stop combo loop immediately.
+      // There is no point trying fallback models when nobody is listening.
+      if (result.status === 499) {
+        log.info("COMBO", `Client disconnected (499) during ${modelStr} — stopping combo loop`);
+        recordComboRequest(combo.name, modelStr, {
+          success: false,
+          latencyMs: Date.now() - startTime,
+          fallbackCount,
+          strategy,
+          target: toRecordedTarget(target),
+        });
+        recordedAttempts++;
+        return result;
+      }
 
       if (providerBreakerOpen) {
         lastError = errorText || String(result.status);
@@ -1704,7 +1758,8 @@ export async function handleComboChat({
       }
 
       // Check if this is a transient error worth retrying on same model
-      const isTransient = [408, 429, 500, 502, 503, 504].includes(result.status);
+      const isTransient =
+        !isStreamReadinessTimeout && [408, 429, 500, 502, 503, 504].includes(result.status);
       if (retry < maxRetries && isTransient) {
         continue; // Retry same model
       }
@@ -1729,7 +1784,21 @@ export async function handleComboChat({
           : 0;
       if ([502, 503, 504].includes(result.status) && fallbackWaitMs > 0) {
         log.info("COMBO", `Waiting ${fallbackWaitMs}ms before fallback to next model`);
-        await new Promise((r) => setTimeout(r, fallbackWaitMs));
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, fallbackWaitMs);
+          signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              resolve(undefined);
+            },
+            { once: true }
+          );
+        });
+        if (signal?.aborted) {
+          log.info("COMBO", `Client disconnected during fallback wait — aborting`);
+          return errorResponse(499, "Client disconnected");
+        }
       }
 
       break; // Move to next model
@@ -1790,6 +1859,7 @@ async function handleRoundRobinCombo({
   log,
   settings,
   allCombos,
+  signal,
 }) {
   const config = settings
     ? resolveComboConfig(combo, settings)
@@ -1959,6 +2029,22 @@ async function handleRoundRobinCombo({
           /* Clone failed */
         }
 
+        if (result.status === 499) {
+          log.info(
+            "COMBO-RR",
+            `Client disconnected (499) during ${modelStr} — stopping combo loop`
+          );
+          recordComboRequest(combo.name, modelStr, {
+            success: false,
+            latencyMs: Date.now() - startTime,
+            fallbackCount,
+            strategy: "round-robin",
+            target: toRecordedTarget(target),
+          });
+          recordedAttempts++;
+          return result;
+        }
+
         if (
           retryAfter &&
           (!earliestRetryAfter || new Date(retryAfter) < new Date(earliestRetryAfter))
@@ -1984,6 +2070,8 @@ async function handleRoundRobinCombo({
           );
           break;
         }
+        const isStreamReadinessTimeout =
+          result.status === 504 && isStreamReadinessTimeoutErrorBody(errorBody);
 
         const { shouldFallback, cooldownMs } = checkFallbackError(
           result.status,
@@ -2034,7 +2122,8 @@ async function handleRoundRobinCombo({
         }
 
         // Transient error → retry same model
-        const isTransient = [408, 429, 500, 502, 503, 504].includes(result.status);
+        const isTransient =
+          !isStreamReadinessTimeout && [408, 429, 500, 502, 503, 504].includes(result.status);
         if (retry < maxRetries && isTransient) {
           continue;
         }
@@ -2059,7 +2148,21 @@ async function handleRoundRobinCombo({
             : 0;
         if ([502, 503, 504].includes(result.status) && fallbackWaitMs > 0) {
           log.info("COMBO-RR", `Waiting ${fallbackWaitMs}ms before fallback to next model`);
-          await new Promise((r) => setTimeout(r, fallbackWaitMs));
+          await new Promise((resolve) => {
+            const timer = setTimeout(resolve, fallbackWaitMs);
+            signal?.addEventListener(
+              "abort",
+              () => {
+                clearTimeout(timer);
+                resolve(undefined);
+              },
+              { once: true }
+            );
+          });
+          if (signal?.aborted) {
+            log.info("COMBO-RR", `Client disconnected during fallback wait — aborting`);
+            return errorResponse(499, "Client disconnected");
+          }
         }
 
         break;
